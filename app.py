@@ -61,10 +61,14 @@ if "code" in st.query_params:
     
     if result and "id_token_claims" in result:
         claims = result["id_token_claims"]
+        
+        # Aggressively hunt for the name across Microsoft's various claim keys
+        user_name = claims.get("name") or claims.get("given_name") or claims.get("extension_DisplayName") or "AI Learner"
+        
         st.session_state.user = {
-            "name": claims.get("name", "Learner"),
+            "name": user_name,
             "oid": claims.get("oid", str(uuid.uuid4())), # Unique ID for privacy-safe tracking
-            "email": claims.get("preferred_username", "External User")
+            "email": claims.get("preferred_username", claims.get("emails", ["External User"])[0])
         }
         st.query_params.clear()
         st.rerun()
