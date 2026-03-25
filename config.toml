@@ -1,0 +1,15 @@
+[theme]
+# Set this to light or dark. Light usually feels more like a traditional website.
+base="light"
+# The primary accent color (changes the active radio buttons and primary buttons)
+primaryColor="#0052cc"
+# Background color of the main app
+backgroundColor="#f4f5f7"
+# Background color of the sidebar
+secondaryBackgroundColor="#ffffff"
+# Font style: sans serif looks the most modern
+font="sans serif"
+
+[client]
+# Hides the "Deploy" button and the Streamlit top menu for a cleaner look
+toolbarMode = "minimal"
