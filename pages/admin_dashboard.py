@@ -4,27 +4,23 @@ import json
 from azure.storage.blob import BlobServiceClient
 
 # --- SECURITY GATEWAY ---
-# This MUST be the first thing to run on the page!
 st.set_page_config(page_title="Admin | Learning Analytics", layout="wide")
 
 ADMIN_EMAIL = "solutionarchitect1975@gmail.com"
 
-# Check 1: Is the user logged in at all?
 if 'user' not in st.session_state or st.session_state.user is None:
     st.warning("🔒 Secure Area. Please log in from the main portal first.")
     st.page_link("app.py", label="← Go to Login Page", icon="🏠")
-    st.stop() # Halts execution
+    st.stop()
 
-# Check 2: Is the user the designated Admin?
-# We use .lower() just in case Azure returns the email with weird casing
 if st.session_state.user.get('email', '').lower() != ADMIN_EMAIL.lower():
     st.error("🛑 Unauthorized Access.")
     st.write(f"Account `{st.session_state.user.get('email', 'Unknown')}` does not have administrator privileges.")
     st.page_link("app.py", label="← Return to My Progress", icon="🔙")
-    st.stop() # Halts execution for non-admins
+    st.stop()
 
 # -----------------------------------------------------------------------------
-# 1. Cloud Connection & Data Fetching
+# 1. Cloud Connection Helpers
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=60)
 def fetch_all_results():
@@ -34,17 +30,32 @@ def fetch_all_results():
         results_container = blob_service_client.get_container_client("results")
         
         results_data = []
-        blobs = results_container.list_blobs()
-        for blob in blobs:
+        for blob in results_container.list_blobs():
             if blob.name.endswith('.json'):
-                blob_client = results_container.get_blob_client(blob)
-                data = blob_client.download_blob().readall()
-                result_json = json.loads(data)
-                results_data.append(result_json)
+                data = results_container.get_blob_client(blob).download_blob().readall()
+                results_data.append(json.loads(data))
         return results_data
     except Exception as e:
-        st.error(f"Failed to connect to Azure Analytics: {e}")
+        st.error(f"Failed to fetch analytics: {e}")
         return []
+
+def upload_quiz_to_azure(quiz_id, quiz_json_data):
+    """Pushes a new quiz JSON directly to the Azure 'quizzes' container."""
+    try:
+        connect_str = st.secrets["AZURE_CONNECTION_STRING"]
+        blob_service_client = BlobServiceClient.from_connection_string(connect_str)
+        quizzes_container = blob_service_client.get_container_client("quizzes")
+        
+        # Ensure the filename ends with .json
+        filename = f"{quiz_id}.json" if not quiz_id.endswith('.json') else quiz_id
+        
+        # Upload and overwrite if it already exists
+        blob_client = quizzes_container.get_blob_client(filename)
+        blob_client.upload_blob(json.dumps(quiz_json_data, indent=4), overwrite=True)
+        return True
+    except Exception as e:
+        st.error(f"Upload failed: {e}")
+        return False
 
 # -----------------------------------------------------------------------------
 # 2. Main Dashboard UI
@@ -52,7 +63,6 @@ def fetch_all_results():
 def run_admin_portal():
     st.title("⚙️ Enterprise Admin Portal")
     
-    # Create tabs for Analytics and Quiz Configuration
     tab_analytics, tab_config = st.tabs(["📊 Analytics Dashboard", "📝 Quiz Configuration"])
     
     # --- TAB 1: ANALYTICS ---
@@ -88,8 +98,7 @@ def run_admin_portal():
                 st.subheader("Learner Engagement")
                 user_activity = df.groupby('user_id').size().reset_index(name='Modules Completed')
                 user_activity['Learner ID'] = user_activity['user_id'].apply(lambda x: f"User_{x[:8]}")
-                user_activity = user_activity[['Learner ID', 'Modules Completed']].sort_values(by='Modules Completed', ascending=False)
-                st.dataframe(user_activity, hide_index=True, use_container_width=True)
+                st.dataframe(user_activity[['Learner ID', 'Modules Completed']].sort_values(by='Modules Completed', ascending=False), hide_index=True, use_container_width=True)
                 
             st.markdown("---")
             st.subheader("Recent Activity Audit Log")
@@ -102,10 +111,59 @@ def run_admin_portal():
 
     # --- TAB 2: QUIZ CONFIGURATION ---
     with tab_config:
-        st.subheader("Quiz Management Engine")
-        st.write("This area will allow you to create, edit, and upload new JSON quiz modules directly to Azure Blob Storage.")
-        # We will build the form here next!
-        st.info("Constructing upload pipeline...")
+        st.subheader("Module Deployment Engine")
+        st.write("Deploy new assessments directly to the Azure Data Lake. They will instantly appear in the learner's Course Catalog.")
+        st.markdown("---")
+        
+        deploy_method = st.radio("Select Deployment Method:", ["Live JSON Editor", "Upload JSON File"], horizontal=True)
+        
+        if deploy_method == "Upload JSON File":
+            st.info("Upload a pre-formatted JSON file containing your quiz structure.")
+            uploaded_file = st.file_uploader("Choose a .json file", type=['json'])
+            
+            if uploaded_file is not None:
+                try:
+                    quiz_data = json.load(uploaded_file)
+                    st.success("JSON successfully validated!")
+                    
+                    quiz_id = st.text_input("Confirm Quiz ID (Filename)", value=uploaded_file.name.replace('.json', ''))
+                    
+                    if st.button("🚀 Deploy to Production", type="primary"):
+                        if upload_quiz_to_azure(quiz_id, quiz_data):
+                            st.success(f"Successfully deployed **{quiz_id}.json** to Azure!")
+                            st.balloons()
+                except json.JSONDecodeError:
+                    st.error("Invalid JSON file. Please check your syntax.")
+                    
+        else:
+            st.info("Draft and deploy a new assessment using the live editor template.")
+            
+            col_id, col_space = st.columns([1, 2])
+            with col_id:
+                quiz_id = st.text_input("Quiz ID (Internal Reference)", value="new_ai_module_01")
+            
+            # A standard schema template to make drafting easy
+            template = {
+                "title": "New AI Architecture Quiz",
+                "questions": [
+                    {
+                        "text": "What is the primary benefit of a semantic layer?",
+                        "options": ["A", "B", "C"],
+                        "answer": "B"
+                    }
+                ]
+            }
+            
+            json_string = st.text_area("JSON Payload", value=json.dumps(template, indent=4), height=350)
+            
+            if st.button("🚀 Deploy to Production", type="primary"):
+                try:
+                    quiz_data = json.loads(json_string)
+                    if upload_quiz_to_azure(quiz_id, quiz_data):
+                        st.success(f"Successfully deployed **{quiz_id}.json** to Azure!")
+                        st.balloons()
+                except json.JSONDecodeError:
+                    st.error("Invalid JSON syntax. Please check for missing commas or brackets before deploying.")
 
 if __name__ == "__main__":
     run_admin_portal()
