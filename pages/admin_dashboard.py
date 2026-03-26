@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import json
 from azure.storage.blob import BlobServiceClient
+import base64
+from openai import OpenAI
 
 # --- SECURITY GATEWAY ---
 st.set_page_config(page_title="Admin | Learning Analytics", layout="wide") #[cite: 1]
@@ -55,24 +57,84 @@ def upload_quiz_to_azure(quiz_id, quiz_json_data): #[cite: 1]
         st.error(f"Upload failed: {e}") #[cite: 1]
         return False #[cite: 1]
 
+
+
 def generate_quiz_via_ai(file_bytes, file_type, quiz_name, num_questions):
     """
-    Placeholder for the LLM call. 
-    This is where we will pass the image/text to the AI to get the JSON.
+    Sends the uploaded file to OpenAI GPT-4o and returns a strict JSON dictionary.
     """
-    # TODO: Insert OpenAI/Gemini API call here.
-    # For now, it returns a strictly formatted mock JSON so you can test the UI flow.
-    return {
-        "title": quiz_name,
+    # Initialize the client using your Streamlit secrets
+    client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+    
+    # The strict instructions to force the exact JSON format
+    system_prompt = f"""
+    You are an expert IT instructor and curriculum designer. Analyze the provided source material.
+    Generate a {num_questions}-question multiple-choice quiz about the core technical concepts.
+    You MUST output ONLY valid JSON matching this exact schema:
+    {{
+        "title": "{quiz_name}",
         "questions": [
-            {
-                "text": f"This is an AI generated question for {quiz_name}?",
-                "options": ["True", "False"],
-                "answer": "True"
-            }
+            {{
+                "text": "Question text here?",
+                "options": ["Option A", "Option B", "Option C", "Option D"],
+                "answer": "Correct Option Exactly As Written"
+            }}
         ]
-    }
+    }}
+    """
+    
+    # Dynamically handle either images or text documents
+    user_content = [{"type": "text", "text": f"Generate {num_questions} questions for the quiz based on this material."}]
+    
+    if file_type in ['image/png', 'image/jpeg', 'image/jpg']:
+        base64_image = base64.b64encode(file_bytes).decode('utf-8')
+        user_content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{file_type};base64,{base64_image}"}
+        })
+    else:
+        # Fallback for .txt or .csv files
+        text_content = file_bytes.decode('utf-8', errors='ignore')
+        user_content.append({"type": "text", "text": f"Source Material:\n{text_content}"})
 
+    try:
+        # Call the GPT-4o model with strict JSON mode enabled
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            response_format={ "type": "json_object" },
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ],
+            temperature=0.2 # Keep it low for factual accuracy
+        )
+        
+        # Parse the string response back into a Python dictionary
+        return json.loads(response.choices[0].message.content)
+        
+    except Exception as e:
+        st.error(f"OpenAI API Generation failed: {e}")
+        return None
+# -----------------------------------------------------------------------------
+# 1.1. upload thumbnails to Azure (for future use in AI-generated quizzes)
+# -----------------------------------------------------------------------------
+
+def upload_thumbnail_to_azure(file_bytes, filename, content_type):
+    """Pushes the uploaded image to Azure and returns the URL."""
+    try:
+        connect_str = st.secrets["AZURE_CONNECTION_STRING"]
+        blob_service_client = BlobServiceClient.from_connection_string(connect_str)
+        # Ensure you have created a 'thumbnails' container in Azure!
+        container_client = blob_service_client.get_container_client("thumbnails")
+        
+        blob_client = container_client.get_blob_client(filename)
+        # Upload the image bytes
+        blob_client.upload_blob(file_bytes, overwrite=True)
+        return blob_client.url
+    except Exception as e:
+        st.error(f"Thumbnail upload failed: {e}")
+        return None
+    
 # -----------------------------------------------------------------------------
 # 2. Main Dashboard UI
 # -----------------------------------------------------------------------------
@@ -146,26 +208,47 @@ def run_admin_portal(): #[cite: 1]
                 
                 submitted = st.form_submit_button("Generate & Deploy", type="primary")
 
-                if submitted:
+            if submitted:
                     if not source_file or not quiz_name:
                         st.warning("Please provide a quiz title and upload a source file.")
                     else:
-                        with st.spinner("AI is analyzing the source and generating the JSON schema..."):
-                            # 1. Read the file
-                            file_bytes = source_file.read()
+                        with st.spinner("Analyzing source, uploading assets, and generating schema..."):
                             
-                            # 2. Pass to our AI function
-                            generated_json = generate_quiz_via_ai(file_bytes, source_file.type, quiz_name, num_questions)
+                            # 1. Format safe filenames
+                            base_filename = quiz_name.lower().replace(" ", "_")
+                            json_filename = f"{base_filename}.json"
                             
-                            # 3. Format filename securely
-                            safe_filename = quiz_name.lower().replace(" ", "_") + ".json"
+                            # 2. Check for existing attempts BEFORE doing anything
+                            raw_results = fetch_all_results()
+                            # Assumes your results JSON saves the quiz title 
+                            attempts = [r for r in raw_results if r.get('title') == quiz_name]
                             
-                            # 4. Push to Azure
-                            if upload_quiz_to_azure(safe_filename, generated_json):
-                                st.success(f"Successfully generated and deployed **{safe_filename}** to Azure!")
-                                st.balloons()
-                                with st.expander("View Generated JSON"):
-                                    st.json(generated_json)
+                            if len(attempts) > 0:
+                                st.error(f"🛑 Overwrite Blocked! {len(attempts)} learners have already attempted this module.")
+                                st.info("To maintain analytics integrity, please change the title to create a new version (e.g., 'Semantic Layer Basics v2').")
+                            else:
+                                # 3. Generate the AI JSON
+                                file_bytes = source_file.read()
+                                generated_json = generate_quiz_via_ai(file_bytes, source_file.type, quiz_name, num_questions)
+                                
+                                # 4. FORCE consistency: Overwrite the AI's title with your exact UI input
+                                generated_json["title"] = quiz_name
+                                
+                                # 5. Upload Image and attach Thumbnail URL
+                                if source_file.type in ['image/png', 'image/jpeg', 'image/jpg']:
+                                    img_ext = source_file.name.split('.')[-1]
+                                    img_filename = f"{base_filename}.{img_ext}"
+                                    thumbnail_url = upload_thumbnail_to_azure(file_bytes, img_filename, source_file.type)
+                                    
+                                    if thumbnail_url:
+                                        generated_json["thumbnail_url"] = thumbnail_url
+                                
+                                # 6. Push final JSON to Azure
+                                if upload_quiz_to_azure(json_filename, generated_json):
+                                    st.success(f"Successfully generated and deployed **{json_filename}** to Azure!")
+                                    st.balloons()
+                                    with st.expander("View Generated JSON & Thumbnail"):
+                                        st.json(generated_json)
 
         # --- EXISTING OPTION 1: UPLOAD JSON ---
         elif deploy_method == "Upload JSON File": #[cite: 1]
