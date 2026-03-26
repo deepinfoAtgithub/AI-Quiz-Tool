@@ -2,3 +2,4 @@ streamlit
 pandas
 azure-storage-blob
 msal
+OpenAI
